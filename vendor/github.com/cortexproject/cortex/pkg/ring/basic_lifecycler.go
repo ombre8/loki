@@ -253,13 +253,11 @@ func (l *BasicLifecycler) registerInstance(ctx context.Context) error {
 			return ringDesc, true, nil
 		}
 
-		if instanceDesc.State != state || !tokens.Equals(instanceDesc.Tokens) {
-			instanceDesc = ringDesc.AddIngester(l.cfg.ID, l.cfg.Addr, l.cfg.Zone, tokens, state)
-			return ringDesc, true, nil
-		}
-
-		// We haven't modified the ring, so don't try to store it.
-		return nil, true, nil
+		// Always overwrite the instance in the ring (even if already exists) because some properties
+		// may have changed (stated, tokens, zone, address) and even if they didn't the heartbeat at
+		// least did.
+		instanceDesc = ringDesc.AddIngester(l.cfg.ID, l.cfg.Addr, l.cfg.Zone, tokens, state)
+		return ringDesc, true, nil
 	})
 
 	if err != nil {
@@ -383,9 +381,16 @@ func (l *BasicLifecycler) updateInstance(ctx context.Context, update func(*Desc,
 			instanceDesc = ringDesc.AddIngester(l.cfg.ID, l.cfg.Addr, l.cfg.Zone, l.GetTokens(), l.GetState())
 		}
 
+		prevTimestamp := instanceDesc.Timestamp
 		changed := update(ringDesc, &instanceDesc)
 		if ok && !changed {
 			return nil, false, nil
+		}
+
+		// Memberlist requires that the timestamp always change, so we do update it unless
+		// was updated in the callback function.
+		if instanceDesc.Timestamp == prevTimestamp {
+			instanceDesc.Timestamp = time.Now().Unix()
 		}
 
 		ringDesc.Ingesters[l.cfg.ID] = instanceDesc

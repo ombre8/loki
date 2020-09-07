@@ -39,7 +39,7 @@ IMAGE_NAMES := $(foreach dir,$(DOCKER_IMAGE_DIRS),$(patsubst %,$(IMAGE_PREFIX)%,
 # make BUILD_IN_CONTAINER=false target
 # or you can override this with an environment variable
 BUILD_IN_CONTAINER ?= true
-BUILD_IMAGE_VERSION := 0.9.2
+BUILD_IMAGE_VERSION := 0.10.0
 
 # Docker image info
 IMAGE_PREFIX ?= grafana
@@ -150,6 +150,9 @@ touch-protobuf-sources:
 
 logcli: yacc cmd/logcli/logcli
 
+logcli-image:
+	$(SUDO) docker build -t $(IMAGE_PREFIX)/logcli:$(IMAGE_TAG) -f cmd/logcli/Dockerfile .
+
 cmd/logcli/logcli: $(APP_GO_FILES) cmd/logcli/main.go
 	CGO_ENABLED=0 go build $(GO_FLAGS) -o $@ ./$(@D)
 	$(NETGO_CHECK)
@@ -239,6 +242,7 @@ publish: dist
 
 lint:
 	GO111MODULE=on GOGC=10 golangci-lint run -v $(GOLANGCI_ARG)
+	faillint -paths "sync/atomic=go.uber.org/atomic" ./...
 
 ########
 # Test #
@@ -327,6 +331,7 @@ helm:
 	-rm -f production/helm/*/requirements.lock
 	@set -e; \
 	helm init -c; \
+	helm repo add elastic https://helm.elastic.co ; \
 	for chart in $(CHARTS); do \
 		helm dependency build $$chart; \
 		helm lint $$chart; \
@@ -434,7 +439,26 @@ fluentd-push:
 
 fluentd-test: LOKI_URL ?= http://localhost:3100/loki/api/
 fluentd-test:
-	LOKI_URL="$(LOKI_URL)" docker-compose -f cmd/fluentd/docker/docker-compose.yml up --build #$(IMAGE_PREFIX)/fluent-plugin-loki:$(IMAGE_TAG)
+	LOKI_URL="$(LOKI_URL)" docker-compose -f cmd/fluentd/docker/docker-compose.yml up --build $(IMAGE_PREFIX)/fluent-plugin-loki:$(IMAGE_TAG)
+
+##################
+# logstash plugin #
+##################
+logstash-image:
+	$(SUDO) docker build -t $(IMAGE_PREFIX)/logstash-output-loki:$(IMAGE_TAG) -f cmd/logstash/Dockerfile ./
+
+# Send 10 lines to the local Loki instance.
+logstash-push-test-logs: LOKI_URL ?= http://host.docker.internal:3100/loki/api/v1/push
+logstash-push-test-logs:
+	$(SUDO) docker run -e LOKI_URL="$(LOKI_URL)" -v `pwd`/cmd/logstash/loki-test.conf:/home/logstash/loki.conf --rm \
+		$(IMAGE_PREFIX)/logstash-output-loki:$(IMAGE_TAG) -f loki.conf
+
+logstash-push:
+	$(SUDO) $(PUSH_OCI) $(IMAGE_PREFIX)/logstash-output-loki:$(IMAGE_TAG)
+
+# Enter an env already configure to build and test logstash output plugin.
+logstash-env:
+	$(SUDO) docker run -v  `pwd`/cmd/logstash:/home/logstash/ -it --rm --entrypoint /bin/sh $(IMAGE_PREFIX)/logstash-output-loki:$(IMAGE_TAG)
 
 ########################
 # Bigtable Backup Tool #

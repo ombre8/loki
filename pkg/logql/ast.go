@@ -21,29 +21,54 @@ type Expr interface {
 	fmt.Stringer
 }
 
+type QueryParams interface {
+	LogSelector() (LogSelectorExpr, error)
+	GetStart() time.Time
+	GetEnd() time.Time
+	GetShards() []string
+}
+
+// implicit holds default implementations
+type implicit struct{}
+
+func (implicit) logQLExpr() {}
+
 // SelectParams specifies parameters passed to data selections.
-type SelectParams struct {
+type SelectLogParams struct {
 	*logproto.QueryRequest
 }
 
 // LogSelector returns the LogSelectorExpr from the SelectParams.
 // The `LogSelectorExpr` can then returns all matchers and filters to use for that request.
-func (s SelectParams) LogSelector() (LogSelectorExpr, error) {
+func (s SelectLogParams) LogSelector() (LogSelectorExpr, error) {
 	return ParseLogSelector(s.Selector)
 }
 
-// QuerierFunc implements Querier.
-type QuerierFunc func(context.Context, SelectParams) (iter.EntryIterator, error)
+type SelectSampleParams struct {
+	*logproto.SampleQueryRequest
+}
 
-// Select implements Querier.
-func (q QuerierFunc) Select(ctx context.Context, p SelectParams) (iter.EntryIterator, error) {
-	return q(ctx, p)
+// Expr returns the SampleExpr from the SelectSampleParams.
+// The `LogSelectorExpr` can then returns all matchers and filters to use for that request.
+func (s SelectSampleParams) Expr() (SampleExpr, error) {
+	return ParseSampleExpr(s.Selector)
+}
+
+// LogSelector returns the LogSelectorExpr from the SelectParams.
+// The `LogSelectorExpr` can then returns all matchers and filters to use for that request.
+func (s SelectSampleParams) LogSelector() (LogSelectorExpr, error) {
+	expr, err := ParseSampleExpr(s.Selector)
+	if err != nil {
+		return nil, err
+	}
+	return expr.Selector(), nil
 }
 
 // Querier allows a LogQL expression to fetch an EntryIterator for a
 // set of matchers and filters
 type Querier interface {
-	Select(context.Context, SelectParams) (iter.EntryIterator, error)
+	SelectLogs(context.Context, SelectLogParams) (iter.EntryIterator, error)
+	SelectSamples(context.Context, SelectSampleParams) (iter.SampleIterator, error)
 }
 
 // LogSelectorExpr is a LogQL expression filtering and returning logs.
@@ -55,6 +80,7 @@ type LogSelectorExpr interface {
 
 type matchersExpr struct {
 	matchers []*labels.Matcher
+	implicit
 }
 
 func newMatcherExpr(matchers []*labels.Matcher) LogSelectorExpr {
@@ -82,13 +108,11 @@ func (e *matchersExpr) Filter() (LineFilter, error) {
 	return nil, nil
 }
 
-// impl Expr
-func (e *matchersExpr) logQLExpr() {}
-
 type filterExpr struct {
 	left  LogSelectorExpr
 	ty    labels.MatchType
 	match string
+	implicit
 }
 
 // NewFilterExpr wraps an existing Expr with a next filter expression.
@@ -143,9 +167,6 @@ func (e *filterExpr) Filter() (LineFilter, error) {
 	return f, nil
 }
 
-// impl Expr
-func (e *filterExpr) logQLExpr() {}
-
 func mustNewMatcher(t labels.MatchType, n, v string) *labels.Matcher {
 	m, err := labels.NewMatcher(t, n, v)
 	if err != nil {
@@ -162,9 +183,7 @@ type logRange struct {
 // impls Stringer
 func (r logRange) String() string {
 	var sb strings.Builder
-	sb.WriteString("(")
 	sb.WriteString(r.left.String())
-	sb.WriteString(")")
 	sb.WriteString(fmt.Sprintf("[%v]", model.Duration(r.interval)))
 	return sb.String()
 }
@@ -248,6 +267,7 @@ func IsLogicalBinOp(op string) bool {
 type SampleExpr interface {
 	// Selector is the LogQL selector to apply when retrieving logs.
 	Selector() LogSelectorExpr
+	Extractor() (SampleExtractor, error)
 	// Operations returns the list of operations used in this SampleExpr
 	Operations() []string
 	Expr
@@ -256,6 +276,7 @@ type SampleExpr interface {
 type rangeAggregationExpr struct {
 	left      *logRange
 	operation string
+	implicit
 }
 
 func newRangeAggregationExpr(left *logRange, operation string) SampleExpr {
@@ -268,9 +289,6 @@ func newRangeAggregationExpr(left *logRange, operation string) SampleExpr {
 func (e *rangeAggregationExpr) Selector() LogSelectorExpr {
 	return e.left.left
 }
-
-// impl Expr
-func (e *rangeAggregationExpr) logQLExpr() {}
 
 // impls Stringer
 func (e *rangeAggregationExpr) String() string {
@@ -311,6 +329,7 @@ type vectorAggregationExpr struct {
 	grouping  *grouping
 	params    int
 	operation string
+	implicit
 }
 
 func mustNewVectorAggregationExpr(left SampleExpr, operation string, gr *grouping, params *string) SampleExpr {
@@ -345,8 +364,9 @@ func (e *vectorAggregationExpr) Selector() LogSelectorExpr {
 	return e.left.Selector()
 }
 
-// impl Expr
-func (e *vectorAggregationExpr) logQLExpr() {}
+func (e *vectorAggregationExpr) Extractor() (SampleExtractor, error) {
+	return e.left.Extractor()
+}
 
 func (e *vectorAggregationExpr) String() string {
 	var params []string
@@ -456,6 +476,7 @@ func reduceBinOp(op string, left, right *literalExpr) *literalExpr {
 
 type literalExpr struct {
 	value float64
+	implicit
 }
 
 func mustNewLiteralExpr(s string, invert bool) *literalExpr {
@@ -473,8 +494,6 @@ func mustNewLiteralExpr(s string, invert bool) *literalExpr {
 	}
 }
 
-func (e *literalExpr) logQLExpr() {}
-
 func (e *literalExpr) String() string {
 	return fmt.Sprintf("%f", e.value)
 }
@@ -482,10 +501,11 @@ func (e *literalExpr) String() string {
 // literlExpr impls SampleExpr & LogSelectorExpr mainly to reduce the need for more complicated typings
 // to facilitate sum types. We'll be type switching when evaluating them anyways
 // and they will only be present in binary operation legs.
-func (e *literalExpr) Selector() LogSelectorExpr   { return e }
-func (e *literalExpr) Operations() []string        { return nil }
-func (e *literalExpr) Filter() (LineFilter, error) { return nil, nil }
-func (e *literalExpr) Matchers() []*labels.Matcher { return nil }
+func (e *literalExpr) Selector() LogSelectorExpr           { return e }
+func (e *literalExpr) Operations() []string                { return nil }
+func (e *literalExpr) Filter() (LineFilter, error)         { return nil, nil }
+func (e *literalExpr) Matchers() []*labels.Matcher         { return nil }
+func (e *literalExpr) Extractor() (SampleExtractor, error) { return nil, nil }
 
 // helper used to impl Stringer for vector and range aggregations
 // nolint:interfacer

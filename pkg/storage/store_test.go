@@ -12,6 +12,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+
+	"github.com/cespare/xxhash/v2"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/stretchr/testify/require"
@@ -27,7 +30,7 @@ import (
 	"github.com/grafana/loki/pkg/logproto"
 	"github.com/grafana/loki/pkg/logql"
 	"github.com/grafana/loki/pkg/logql/marshal"
-	"github.com/grafana/loki/pkg/storage/stores/local"
+	"github.com/grafana/loki/pkg/storage/stores/shipper"
 	"github.com/grafana/loki/pkg/util/validation"
 )
 
@@ -39,9 +42,9 @@ var (
 )
 
 //go test -bench=. -benchmem -memprofile memprofile.out -cpuprofile profile.out
-func Benchmark_store_LazyQueryRegexBackward(b *testing.B) {
+func Benchmark_store_SelectLogsRegexBackward(b *testing.B) {
 	benchmarkStoreQuery(b, &logproto.QueryRequest{
-		Selector:  `{foo="bar"} |= "fuzz"`,
+		Selector:  `{foo="bar"} |~ "fuzz"`,
 		Limit:     1000,
 		Start:     time.Unix(0, start.UnixNano()),
 		End:       time.Unix(0, (24*time.Hour.Nanoseconds())+start.UnixNano()),
@@ -49,7 +52,7 @@ func Benchmark_store_LazyQueryRegexBackward(b *testing.B) {
 	})
 }
 
-func Benchmark_store_LazyQueryLogQLBackward(b *testing.B) {
+func Benchmark_store_SelectLogsLogQLBackward(b *testing.B) {
 	benchmarkStoreQuery(b, &logproto.QueryRequest{
 		Selector:  `{foo="bar"} |= "test" != "toto" |= "fuzz"`,
 		Limit:     1000,
@@ -59,9 +62,9 @@ func Benchmark_store_LazyQueryLogQLBackward(b *testing.B) {
 	})
 }
 
-func Benchmark_store_LazyQueryRegexForward(b *testing.B) {
+func Benchmark_store_SelectLogsRegexForward(b *testing.B) {
 	benchmarkStoreQuery(b, &logproto.QueryRequest{
-		Selector:  `{foo="bar"} |= "fuzz"`,
+		Selector:  `{foo="bar"} |~ "fuzz"`,
 		Limit:     1000,
 		Start:     time.Unix(0, start.UnixNano()),
 		End:       time.Unix(0, (24*time.Hour.Nanoseconds())+start.UnixNano()),
@@ -69,7 +72,7 @@ func Benchmark_store_LazyQueryRegexForward(b *testing.B) {
 	})
 }
 
-func Benchmark_store_LazyQueryForward(b *testing.B) {
+func Benchmark_store_SelectLogsForward(b *testing.B) {
 	benchmarkStoreQuery(b, &logproto.QueryRequest{
 		Selector:  `{foo="bar"}`,
 		Limit:     1000,
@@ -79,7 +82,7 @@ func Benchmark_store_LazyQueryForward(b *testing.B) {
 	})
 }
 
-func Benchmark_store_LazyQueryBackward(b *testing.B) {
+func Benchmark_store_SelectLogsBackward(b *testing.B) {
 	benchmarkStoreQuery(b, &logproto.QueryRequest{
 		Selector:  `{foo="bar"}`,
 		Limit:     1000,
@@ -87,6 +90,37 @@ func Benchmark_store_LazyQueryBackward(b *testing.B) {
 		End:       time.Unix(0, (24*time.Hour.Nanoseconds())+start.UnixNano()),
 		Direction: logproto.BACKWARD,
 	})
+}
+
+// rm -Rf /tmp/benchmark/chunks/ /tmp/benchmark/index
+// go run  -mod=vendor ./pkg/storage/hack/main.go
+// go test -benchmem -run=^$ -mod=vendor  ./pkg/storage -bench=Benchmark_store_SelectSample   -memprofile memprofile.out -cpuprofile cpuprofile.out
+func Benchmark_store_SelectSample(b *testing.B) {
+	var sampleRes []logproto.Sample
+	for _, test := range []string{
+		`count_over_time({foo="bar"}[5m])`,
+		`rate({foo="bar"}[5m])`,
+		`bytes_rate({foo="bar"}[5m])`,
+		`bytes_over_time({foo="bar"}[5m])`,
+	} {
+		b.Run(test, func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				iter, err := chunkStore.SelectSamples(ctx, logql.SelectSampleParams{
+					SampleQueryRequest: newSampleQuery(test, time.Unix(0, start.UnixNano()), time.Unix(0, (24*time.Hour.Nanoseconds())+start.UnixNano())),
+				})
+				if err != nil {
+					b.Fatal(err)
+				}
+
+				for iter.Next() {
+					sampleRes = append(sampleRes, iter.Sample())
+				}
+				iter.Close()
+			}
+		})
+	}
+	log.Print("sample processed ", len(sampleRes))
+
 }
 
 func benchmarkStoreQuery(b *testing.B, query *logproto.QueryRequest) {
@@ -111,7 +145,7 @@ func benchmarkStoreQuery(b *testing.B, query *logproto.QueryRequest) {
 		}
 	}()
 	for i := 0; i < b.N; i++ {
-		iter, err := chunkStore.LazyQuery(ctx, logql.SelectParams{QueryRequest: query})
+		iter, err := chunkStore.SelectLogs(ctx, logql.SelectLogParams{QueryRequest: query})
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -160,7 +194,7 @@ func getLocalStore() Store {
 			FSConfig:     cortex_local.FSConfig{Directory: "/tmp/benchmark/chunks"},
 		},
 		MaxChunkBatchSize: 10,
-	}, chunk.StoreConfig{}, chunk.SchemaConfig{
+	}, chunk.StoreConfig{}, SchemaConfig{chunk.SchemaConfig{
 		Configs: []chunk.PeriodConfig{
 			{
 				From:       chunk.DayTime{Time: start},
@@ -173,14 +207,14 @@ func getLocalStore() Store {
 				},
 			},
 		},
-	}, limits, nil)
+	}}, limits, nil)
 	if err != nil {
 		panic(err)
 	}
 	return store
 }
 
-func Test_store_LazyQuery(t *testing.T) {
+func Test_store_SelectLogs(t *testing.T) {
 
 	tests := []struct {
 		name     string
@@ -189,7 +223,7 @@ func Test_store_LazyQuery(t *testing.T) {
 	}{
 		{
 			"all",
-			newQuery("{foo=~\"ba.*\"}", from, from.Add(6*time.Millisecond), logproto.FORWARD, nil),
+			newQuery("{foo=~\"ba.*\"}", from, from.Add(6*time.Millisecond), nil),
 			[]logproto.Stream{
 				{
 					Labels: "{foo=\"bar\"}",
@@ -257,7 +291,7 @@ func Test_store_LazyQuery(t *testing.T) {
 		},
 		{
 			"filter regex",
-			newQuery("{foo=~\"ba.*\"} |~ \"1|2|3\" !~ \"2|3\"", from, from.Add(6*time.Millisecond), logproto.FORWARD, nil),
+			newQuery("{foo=~\"ba.*\"} |~ \"1|2|3\" !~ \"2|3\"", from, from.Add(6*time.Millisecond), nil),
 			[]logproto.Stream{
 				{
 					Labels: "{foo=\"bar\"}",
@@ -281,7 +315,7 @@ func Test_store_LazyQuery(t *testing.T) {
 		},
 		{
 			"filter matcher",
-			newQuery("{foo=\"bar\"}", from, from.Add(6*time.Millisecond), logproto.FORWARD, nil),
+			newQuery("{foo=\"bar\"}", from, from.Add(6*time.Millisecond), nil),
 			[]logproto.Stream{
 				{
 					Labels: "{foo=\"bar\"}",
@@ -318,7 +352,7 @@ func Test_store_LazyQuery(t *testing.T) {
 		},
 		{
 			"filter time",
-			newQuery("{foo=~\"ba.*\"}", from, from.Add(time.Millisecond), logproto.FORWARD, nil),
+			newQuery("{foo=~\"ba.*\"}", from, from.Add(time.Millisecond), nil),
 			[]logproto.Stream{
 				{
 					Labels: "{foo=\"bar\"}",
@@ -348,10 +382,11 @@ func Test_store_LazyQuery(t *testing.T) {
 				cfg: Config{
 					MaxChunkBatchSize: 10,
 				},
+				chunkMetrics: NilMetrics,
 			}
 
 			ctx = user.InjectOrgID(context.Background(), "test-user")
-			it, err := s.LazyQuery(ctx, logql.SelectParams{QueryRequest: tt.req})
+			it, err := s.SelectLogs(ctx, logql.SelectLogParams{QueryRequest: tt.req})
 			if err != nil {
 				t.Errorf("store.LazyQuery() error = %v", err)
 				return
@@ -367,6 +402,216 @@ func Test_store_LazyQuery(t *testing.T) {
 	}
 }
 
+func Test_store_SelectSample(t *testing.T) {
+
+	tests := []struct {
+		name     string
+		req      *logproto.SampleQueryRequest
+		expected []logproto.Series
+	}{
+		{
+			"all",
+			newSampleQuery("count_over_time({foo=~\"ba.*\"}[5m])", from, from.Add(6*time.Millisecond)),
+			[]logproto.Series{
+				{
+					Labels: "{foo=\"bar\"}",
+					Samples: []logproto.Sample{
+						{
+							Timestamp: from.UnixNano(),
+							Hash:      xxhash.Sum64String("1"),
+							Value:     1.,
+						},
+
+						{
+							Timestamp: from.Add(time.Millisecond).UnixNano(),
+							Hash:      xxhash.Sum64String("2"),
+							Value:     1.,
+						},
+						{
+							Timestamp: from.Add(2 * time.Millisecond).UnixNano(),
+							Hash:      xxhash.Sum64String("3"),
+							Value:     1.,
+						},
+						{
+							Timestamp: from.Add(3 * time.Millisecond).UnixNano(),
+							Hash:      xxhash.Sum64String("4"),
+							Value:     1.,
+						},
+
+						{
+							Timestamp: from.Add(4 * time.Millisecond).UnixNano(),
+							Hash:      xxhash.Sum64String("5"),
+							Value:     1.,
+						},
+						{
+							Timestamp: from.Add(5 * time.Millisecond).UnixNano(),
+							Hash:      xxhash.Sum64String("6"),
+							Value:     1.,
+						},
+					},
+				},
+				{
+					Labels: "{foo=\"bazz\"}",
+					Samples: []logproto.Sample{
+						{
+							Timestamp: from.UnixNano(),
+							Hash:      xxhash.Sum64String("1"),
+							Value:     1.,
+						},
+
+						{
+							Timestamp: from.Add(time.Millisecond).UnixNano(),
+							Hash:      xxhash.Sum64String("2"),
+							Value:     1.,
+						},
+						{
+							Timestamp: from.Add(2 * time.Millisecond).UnixNano(),
+							Hash:      xxhash.Sum64String("3"),
+							Value:     1.,
+						},
+						{
+							Timestamp: from.Add(3 * time.Millisecond).UnixNano(),
+							Hash:      xxhash.Sum64String("4"),
+							Value:     1.,
+						},
+
+						{
+							Timestamp: from.Add(4 * time.Millisecond).UnixNano(),
+							Hash:      xxhash.Sum64String("5"),
+							Value:     1.,
+						},
+						{
+							Timestamp: from.Add(5 * time.Millisecond).UnixNano(),
+							Hash:      xxhash.Sum64String("6"),
+							Value:     1.,
+						},
+					},
+				},
+			},
+		},
+		{
+			"filter regex",
+			newSampleQuery("rate({foo=~\"ba.*\"} |~ \"1|2|3\" !~ \"2|3\"[1m])", from, from.Add(6*time.Millisecond)),
+			[]logproto.Series{
+				{
+					Labels: "{foo=\"bar\"}",
+					Samples: []logproto.Sample{
+						{
+							Timestamp: from.UnixNano(),
+							Hash:      xxhash.Sum64String("1"),
+							Value:     1.,
+						},
+					},
+				},
+				{
+					Labels: "{foo=\"bazz\"}",
+					Samples: []logproto.Sample{
+						{
+							Timestamp: from.UnixNano(),
+							Hash:      xxhash.Sum64String("1"),
+							Value:     1.,
+						},
+					},
+				},
+			},
+		},
+		{
+			"filter matcher",
+			newSampleQuery("count_over_time({foo=\"bar\"}[10m])", from, from.Add(6*time.Millisecond)),
+			[]logproto.Series{
+				{
+					Labels: "{foo=\"bar\"}",
+					Samples: []logproto.Sample{
+						{
+							Timestamp: from.UnixNano(),
+							Hash:      xxhash.Sum64String("1"),
+							Value:     1.,
+						},
+
+						{
+							Timestamp: from.Add(time.Millisecond).UnixNano(),
+							Hash:      xxhash.Sum64String("2"),
+							Value:     1.,
+						},
+						{
+							Timestamp: from.Add(2 * time.Millisecond).UnixNano(),
+							Hash:      xxhash.Sum64String("3"),
+							Value:     1.,
+						},
+						{
+							Timestamp: from.Add(3 * time.Millisecond).UnixNano(),
+							Hash:      xxhash.Sum64String("4"),
+							Value:     1.,
+						},
+
+						{
+							Timestamp: from.Add(4 * time.Millisecond).UnixNano(),
+							Hash:      xxhash.Sum64String("5"),
+							Value:     1.,
+						},
+						{
+							Timestamp: from.Add(5 * time.Millisecond).UnixNano(),
+							Hash:      xxhash.Sum64String("6"),
+							Value:     1.,
+						},
+					},
+				},
+			},
+		},
+		{
+			"filter time",
+			newSampleQuery("count_over_time({foo=~\"ba.*\"}[1s])", from, from.Add(time.Millisecond)),
+			[]logproto.Series{
+				{
+					Labels: "{foo=\"bar\"}",
+					Samples: []logproto.Sample{
+						{
+							Timestamp: from.UnixNano(),
+							Hash:      xxhash.Sum64String("1"),
+							Value:     1.,
+						},
+					},
+				},
+				{
+					Labels: "{foo=\"bazz\"}",
+					Samples: []logproto.Sample{
+						{
+							Timestamp: from.UnixNano(),
+							Hash:      xxhash.Sum64String("1"),
+							Value:     1.,
+						},
+					},
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &store{
+				Store: storeFixture,
+				cfg: Config{
+					MaxChunkBatchSize: 10,
+				},
+				chunkMetrics: NilMetrics,
+			}
+
+			ctx = user.InjectOrgID(context.Background(), "test-user")
+			it, err := s.SelectSamples(ctx, logql.SelectSampleParams{SampleQueryRequest: tt.req})
+			if err != nil {
+				t.Errorf("store.LazyQuery() error = %v", err)
+				return
+			}
+
+			series, _, err := iter.ReadSampleBatch(it, uint32(100000))
+			_ = it.Close()
+			if err != nil {
+				t.Fatalf("error reading batch %s", err)
+			}
+			assertSeries(t, tt.expected, series.Series)
+		})
+	}
+}
+
 func Test_store_GetSeries(t *testing.T) {
 
 	tests := []struct {
@@ -377,7 +622,7 @@ func Test_store_GetSeries(t *testing.T) {
 	}{
 		{
 			"all",
-			newQuery("{foo=~\"ba.*\"}", from, from.Add(6*time.Millisecond), logproto.FORWARD, nil),
+			newQuery("{foo=~\"ba.*\"}", from, from.Add(6*time.Millisecond), nil),
 			[]logproto.SeriesIdentifier{
 				{Labels: mustParseLabels("{foo=\"bar\"}")},
 				{Labels: mustParseLabels("{foo=\"bazz\"}")},
@@ -386,7 +631,7 @@ func Test_store_GetSeries(t *testing.T) {
 		},
 		{
 			"all-single-batch",
-			newQuery("{foo=~\"ba.*\"}", from, from.Add(6*time.Millisecond), logproto.FORWARD, nil),
+			newQuery("{foo=~\"ba.*\"}", from, from.Add(6*time.Millisecond), nil),
 			[]logproto.SeriesIdentifier{
 				{Labels: mustParseLabels("{foo=\"bar\"}")},
 				{Labels: mustParseLabels("{foo=\"bazz\"}")},
@@ -395,7 +640,7 @@ func Test_store_GetSeries(t *testing.T) {
 		},
 		{
 			"regexp filter (post chunk fetching)",
-			newQuery("{foo=~\"bar.*\"}", from, from.Add(6*time.Millisecond), logproto.FORWARD, nil),
+			newQuery("{foo=~\"bar.*\"}", from, from.Add(6*time.Millisecond), nil),
 			[]logproto.SeriesIdentifier{
 				{Labels: mustParseLabels("{foo=\"bar\"}")},
 			},
@@ -403,7 +648,7 @@ func Test_store_GetSeries(t *testing.T) {
 		},
 		{
 			"filter matcher",
-			newQuery("{foo=\"bar\"}", from, from.Add(6*time.Millisecond), logproto.FORWARD, nil),
+			newQuery("{foo=\"bar\"}", from, from.Add(6*time.Millisecond), nil),
 			[]logproto.SeriesIdentifier{
 				{Labels: mustParseLabels("{foo=\"bar\"}")},
 			},
@@ -417,9 +662,10 @@ func Test_store_GetSeries(t *testing.T) {
 				cfg: Config{
 					MaxChunkBatchSize: tt.batchSize,
 				},
+				chunkMetrics: NilMetrics,
 			}
 			ctx = user.InjectOrgID(context.Background(), "test-user")
-			out, err := s.GetSeries(ctx, logql.SelectParams{QueryRequest: tt.req})
+			out, err := s.GetSeries(ctx, logql.SelectLogParams{QueryRequest: tt.req})
 			if err != nil {
 				t.Errorf("store.GetSeries() error = %v", err)
 				return
@@ -437,7 +683,7 @@ func Test_store_decodeReq_Matchers(t *testing.T) {
 	}{
 		{
 			"unsharded",
-			newQuery("{foo=~\"ba.*\"}", from, from.Add(6*time.Millisecond), logproto.FORWARD, nil),
+			newQuery("{foo=~\"ba.*\"}", from, from.Add(6*time.Millisecond), nil),
 			[]*labels.Matcher{
 				labels.MustNewMatcher(labels.MatchRegexp, "foo", "ba.*"),
 				labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "logs"),
@@ -446,7 +692,7 @@ func Test_store_decodeReq_Matchers(t *testing.T) {
 		{
 			"unsharded",
 			newQuery(
-				"{foo=~\"ba.*\"}", from, from.Add(6*time.Millisecond), logproto.FORWARD,
+				"{foo=~\"ba.*\"}", from, from.Add(6*time.Millisecond),
 				[]astmapper.ShardAnnotation{
 					{Shard: 1, Of: 2},
 				},
@@ -464,7 +710,7 @@ func Test_store_decodeReq_Matchers(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ms, _, _, _, err := decodeReq(logql.SelectParams{QueryRequest: tt.req})
+			ms, _, _, _, err := decodeReq(logql.SelectLogParams{QueryRequest: tt.req})
 			if err != nil {
 				t.Errorf("store.GetSeries() error = %v", err)
 				return
@@ -490,7 +736,7 @@ func TestStore_MultipleBoltDBShippersInConfig(t *testing.T) {
 	require.NoError(t, err)
 
 	// config for BoltDB Shipper
-	boltdbShipperConfig := local.ShipperConfig{}
+	boltdbShipperConfig := shipper.Config{}
 	flagext.DefaultValues(&boltdbShipperConfig)
 	boltdbShipperConfig.ActiveIndexDirectory = path.Join(tempDir, "index")
 	boltdbShipperConfig.SharedStoreType = "filesystem"
@@ -507,9 +753,9 @@ func TestStore_MultipleBoltDBShippersInConfig(t *testing.T) {
 		BoltDBShipperConfig: boltdbShipperConfig,
 	}
 
-	RegisterCustomIndexClients(config, nil)
+	RegisterCustomIndexClients(&config, nil)
 
-	store, err := NewStore(config, chunk.StoreConfig{}, chunk.SchemaConfig{
+	store, err := NewStore(config, chunk.StoreConfig{}, SchemaConfig{chunk.SchemaConfig{
 		Configs: []chunk.PeriodConfig{
 			{
 				From:       chunk.DayTime{Time: timeToModelTime(firstStoreDate)},
@@ -533,7 +779,7 @@ func TestStore_MultipleBoltDBShippersInConfig(t *testing.T) {
 				RowShards: 2,
 			},
 		},
-	}, limits, nil)
+	}}, limits, nil)
 	require.NoError(t, err)
 
 	// time ranges adding a chunk for each store and a chunk which overlaps both the stores
@@ -616,4 +862,166 @@ func buildTestStreams(labels string, tr timeRange) logproto.Stream {
 
 func timeToModelTime(t time.Time) model.Time {
 	return model.TimeFromUnixNano(t.UnixNano())
+}
+
+func TestActiveIndexType(t *testing.T) {
+	var cfg SchemaConfig
+
+	// just one PeriodConfig in the past
+	cfg.Configs = []chunk.PeriodConfig{{
+		From:      chunk.DayTime{Time: model.Now().Add(-24 * time.Hour)},
+		IndexType: "first",
+	}}
+
+	assert.Equal(t, 0, ActivePeriodConfig(cfg))
+
+	// add a newer PeriodConfig in the past which should be considered
+	cfg.Configs = append(cfg.Configs, chunk.PeriodConfig{
+		From:      chunk.DayTime{Time: model.Now().Add(-12 * time.Hour)},
+		IndexType: "second",
+	})
+	assert.Equal(t, 1, ActivePeriodConfig(cfg))
+
+	// add a newer PeriodConfig in the future which should not be considered
+	cfg.Configs = append(cfg.Configs, chunk.PeriodConfig{
+		From:      chunk.DayTime{Time: model.Now().Add(time.Hour)},
+		IndexType: "third",
+	})
+	assert.Equal(t, 1, ActivePeriodConfig(cfg))
+}
+
+func TestUsingBoltdbShipper(t *testing.T) {
+	var cfg SchemaConfig
+
+	// just one PeriodConfig in the past using boltdb-shipper
+	cfg.Configs = []chunk.PeriodConfig{{
+		From:      chunk.DayTime{Time: model.Now().Add(-24 * time.Hour)},
+		IndexType: "boltdb-shipper",
+	}}
+	assert.Equal(t, true, UsingBoltdbShipper(cfg))
+
+	// just one PeriodConfig in the past not using boltdb-shipper
+	cfg.Configs[0].IndexType = "boltdb"
+	assert.Equal(t, false, UsingBoltdbShipper(cfg))
+
+	// add a newer PeriodConfig in the future using boltdb-shipper
+	cfg.Configs = append(cfg.Configs, chunk.PeriodConfig{
+		From:      chunk.DayTime{Time: model.Now().Add(time.Hour)},
+		IndexType: "boltdb-shipper",
+	})
+	assert.Equal(t, true, UsingBoltdbShipper(cfg))
+}
+
+func TestSchemaConfig_Validate(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		configs []chunk.PeriodConfig
+		err     error
+	}{
+		{
+			name:    "empty",
+			configs: []chunk.PeriodConfig{},
+			err:     zeroLengthConfigError,
+		},
+		{
+			name: "NOT using boltdb-shipper",
+			configs: []chunk.PeriodConfig{{
+				From:      chunk.DayTime{Time: model.Now().Add(-24 * time.Hour)},
+				IndexType: "boltdb",
+				Schema:    "v9",
+				IndexTables: chunk.PeriodicTableConfig{
+					Period: 7 * 24 * time.Hour,
+				},
+			}},
+		},
+		{
+			name: "current config boltdb-shipper with 7 days periodic config, without future index type changes",
+			configs: []chunk.PeriodConfig{{
+				From:      chunk.DayTime{Time: model.Now().Add(-24 * time.Hour)},
+				IndexType: "boltdb-shipper",
+				Schema:    "v9",
+				IndexTables: chunk.PeriodicTableConfig{
+					Period: 7 * 24 * time.Hour,
+				},
+			}},
+			err: currentBoltdbShipperNon24HoursErr,
+		},
+		{
+			name: "current config boltdb-shipper with 1 day periodic config, without future index type changes",
+			configs: []chunk.PeriodConfig{{
+				From:      chunk.DayTime{Time: model.Now().Add(-24 * time.Hour)},
+				IndexType: "boltdb-shipper",
+				Schema:    "v9",
+				IndexTables: chunk.PeriodicTableConfig{
+					Period: 24 * time.Hour,
+				},
+			}},
+		},
+		{
+			name: "current config boltdb-shipper with 7 days periodic config, upcoming config NOT boltdb-shipper",
+			configs: []chunk.PeriodConfig{{
+				From:      chunk.DayTime{Time: model.Now().Add(-24 * time.Hour)},
+				IndexType: "boltdb-shipper",
+				Schema:    "v9",
+				IndexTables: chunk.PeriodicTableConfig{
+					Period: 24 * time.Hour,
+				},
+			}, {
+				From:      chunk.DayTime{Time: model.Now().Add(time.Hour)},
+				IndexType: "boltdb",
+				Schema:    "v9",
+				IndexTables: chunk.PeriodicTableConfig{
+					Period: 7 * 24 * time.Hour,
+				},
+			}},
+		},
+		{
+			name: "current and upcoming config boltdb-shipper with 7 days periodic config",
+			configs: []chunk.PeriodConfig{{
+				From:      chunk.DayTime{Time: model.Now().Add(-24 * time.Hour)},
+				IndexType: "boltdb-shipper",
+				Schema:    "v9",
+				IndexTables: chunk.PeriodicTableConfig{
+					Period: 24 * time.Hour,
+				},
+			}, {
+				From:      chunk.DayTime{Time: model.Now().Add(time.Hour)},
+				IndexType: "boltdb-shipper",
+				Schema:    "v9",
+				IndexTables: chunk.PeriodicTableConfig{
+					Period: 7 * 24 * time.Hour,
+				},
+			}},
+			err: upcomingBoltdbShipperNon24HoursErr,
+		},
+		{
+			name: "current config NOT boltdb-shipper, upcoming config boltdb-shipper with 7 days periodic config",
+			configs: []chunk.PeriodConfig{{
+				From:      chunk.DayTime{Time: model.Now().Add(-24 * time.Hour)},
+				IndexType: "boltdb",
+				Schema:    "v9",
+				IndexTables: chunk.PeriodicTableConfig{
+					Period: 24 * time.Hour,
+				},
+			}, {
+				From:      chunk.DayTime{Time: model.Now().Add(time.Hour)},
+				IndexType: "boltdb-shipper",
+				Schema:    "v9",
+				IndexTables: chunk.PeriodicTableConfig{
+					Period: 7 * 24 * time.Hour,
+				},
+			}},
+			err: upcomingBoltdbShipperNon24HoursErr,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := SchemaConfig{chunk.SchemaConfig{Configs: tc.configs}}
+			err := cfg.Validate()
+			if tc.err == nil {
+				require.NoError(t, err)
+			} else {
+				require.EqualError(t, err, tc.err.Error())
+			}
+		})
+	}
 }

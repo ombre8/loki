@@ -14,6 +14,7 @@ import (
 	"github.com/gogo/protobuf/types"
 	"github.com/opentracing/opentracing-go"
 	otlog "github.com/opentracing/opentracing-go/log"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"github.com/uber/jaeger-client-go"
 	"github.com/weaveworks/common/httpgrpc"
@@ -26,8 +27,8 @@ import (
 )
 
 var (
-	// Value that cachecontrolHeader has if the response indicates that the results should not be cached.
-	noCacheValue = "no-store"
+	// Value that cacheControlHeader has if the response indicates that the results should not be cached.
+	noStoreValue = "no-store"
 
 	// ResultsCacheGenNumberHeaderName holds name of the header we want to set in http response
 	ResultsCacheGenNumberHeaderName = "Results-Cache-Gen-Number"
@@ -101,6 +102,10 @@ func (t constSplitter) GenerateCacheKey(userID string, r Request) string {
 	return fmt.Sprintf("%s:%s:%d:%d", userID, r.GetQuery(), r.GetStep(), currentInterval)
 }
 
+// ShouldCacheFn checks whether the current request should go to cache
+// or not. If not, just send the request to next handler.
+type ShouldCacheFn func(r Request) bool
+
 type resultsCache struct {
 	logger   log.Logger
 	cfg      ResultsCacheConfig
@@ -112,6 +117,7 @@ type resultsCache struct {
 	extractor            Extractor
 	merger               Merger
 	cacheGenNumberLoader CacheGenNumberLoader
+	shouldCache          ShouldCacheFn
 }
 
 // NewResultsCacheMiddleware creates results cache middleware from config.
@@ -128,8 +134,10 @@ func NewResultsCacheMiddleware(
 	merger Merger,
 	extractor Extractor,
 	cacheGenNumberLoader CacheGenNumberLoader,
+	shouldCache ShouldCacheFn,
+	reg prometheus.Registerer,
 ) (Middleware, cache.Cache, error) {
-	c, err := cache.New(cfg.CacheConfig)
+	c, err := cache.New(cfg.CacheConfig, reg, logger)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -149,6 +157,7 @@ func NewResultsCacheMiddleware(
 			extractor:            extractor,
 			splitter:             splitter,
 			cacheGenNumberLoader: cacheGenNumberLoader,
+			shouldCache:          shouldCache,
 		}
 	}), c, nil
 }
@@ -157,6 +166,10 @@ func (s resultsCache) Do(ctx context.Context, r Request) (Response, error) {
 	userID, err := user.ExtractOrgID(ctx)
 	if err != nil {
 		return nil, httpgrpc.Errorf(http.StatusBadRequest, err.Error())
+	}
+
+	if s.shouldCache != nil && !s.shouldCache(r) {
+		return s.next.Do(ctx, r)
 	}
 
 	if s.cacheGenNumberLoader != nil {
@@ -199,10 +212,10 @@ func (s resultsCache) Do(ctx context.Context, r Request) (Response, error) {
 
 // shouldCacheResponse says whether the response should be cached or not.
 func (s resultsCache) shouldCacheResponse(ctx context.Context, r Response) bool {
-	headerValues := getHeaderValuesWithName(r, cachecontrolHeader)
+	headerValues := getHeaderValuesWithName(r, cacheControlHeader)
 	for _, v := range headerValues {
-		if v == noCacheValue {
-			level.Debug(s.logger).Log("msg", fmt.Sprintf("%s header in response is equal to %s, not caching the response", cachecontrolHeader, noCacheValue))
+		if v == noStoreValue {
+			level.Debug(s.logger).Log("msg", fmt.Sprintf("%s header in response is equal to %s, not caching the response", cacheControlHeader, noStoreValue))
 			return false
 		}
 	}
@@ -448,14 +461,14 @@ func (s resultsCache) get(ctx context.Context, key string) ([]Extent, bool) {
 	}
 
 	var resp CachedResponse
-	sp, _ := opentracing.StartSpanFromContext(ctx, "unmarshal-extent")
-	defer sp.Finish()
+	log, ctx := spanlogger.New(ctx, "unmarshal-extent") //nolint:ineffassign,staticcheck
+	defer log.Finish()
 
-	sp.LogFields(otlog.Int("bytes", len(bufs[0])))
+	log.LogFields(otlog.Int("bytes", len(bufs[0])))
 
 	if err := proto.Unmarshal(bufs[0], &resp); err != nil {
-		level.Error(s.logger).Log("msg", "error unmarshalling cached value", "err", err)
-		sp.LogFields(otlog.Error(err))
+		level.Error(log).Log("msg", "error unmarshalling cached value", "err", err)
+		log.Error(err)
 		return nil, false
 	}
 

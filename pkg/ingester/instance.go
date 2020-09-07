@@ -28,7 +28,10 @@ import (
 	"github.com/grafana/loki/pkg/util/validation"
 )
 
-const queryBatchSize = 128
+const (
+	queryBatchSize       = 128
+	queryBatchSampleSize = 512
+)
 
 // Errors returned on Query.
 var (
@@ -192,8 +195,8 @@ func (i *instance) getLabelsFromFingerprint(fp model.Fingerprint) labels.Labels 
 	return s.labels
 }
 
-func (i *instance) Query(ctx context.Context, req *logproto.QueryRequest) ([]iter.EntryIterator, error) {
-	expr, err := (logql.SelectParams{QueryRequest: req}).LogSelector()
+func (i *instance) Query(ctx context.Context, req logql.SelectLogParams) ([]iter.EntryIterator, error) {
+	expr, err := req.LogSelector()
 	if err != nil {
 		return nil, err
 	}
@@ -209,6 +212,40 @@ func (i *instance) Query(ctx context.Context, req *logproto.QueryRequest) ([]ite
 		func(stream *stream) error {
 			ingStats.TotalChunksMatched += int64(len(stream.chunks))
 			iter, err := stream.Iterator(ctx, req.Start, req.End, req.Direction, filter)
+			if err != nil {
+				return err
+			}
+			iters = append(iters, iter)
+			return nil
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return iters, nil
+}
+
+func (i *instance) QuerySample(ctx context.Context, req logql.SelectSampleParams) ([]iter.SampleIterator, error) {
+	expr, err := req.Expr()
+	if err != nil {
+		return nil, err
+	}
+	filter, err := expr.Selector().Filter()
+	if err != nil {
+		return nil, err
+	}
+	extractor, err := expr.Extractor()
+	if err != nil {
+		return nil, err
+	}
+	ingStats := stats.GetIngesterData(ctx)
+	var iters []iter.SampleIterator
+	err = i.forMatchingStreams(
+		expr.Selector().Matchers(),
+		func(stream *stream) error {
+			ingStats.TotalChunksMatched += int64(len(stream.chunks))
+			iter, err := stream.SampleIterator(ctx, req.Start, req.End, filter, extractor)
 			if err != nil {
 				return err
 			}
@@ -249,31 +286,68 @@ func (i *instance) Series(_ context.Context, req *logproto.SeriesRequest) (*logp
 		return nil, err
 	}
 
-	dedupedSeries := make(map[uint64]logproto.SeriesIdentifier)
-	for _, matchers := range groups {
-		err = i.forMatchingStreams(matchers, func(stream *stream) error {
-			// exit early when this stream was added by an earlier group
-			key := stream.labels.Hash()
-			if _, found := dedupedSeries[key]; found {
-				return nil
-			}
+	var series []logproto.SeriesIdentifier
 
-			dedupedSeries[key] = logproto.SeriesIdentifier{
-				Labels: stream.labels.Map(),
+	// If no matchers were supplied we include all streams.
+	if len(groups) == 0 {
+		series = make([]logproto.SeriesIdentifier, 0, len(i.streams))
+		err = i.forAllStreams(func(stream *stream) error {
+			// consider the stream only if it overlaps the request time range
+			if shouldConsiderStream(stream, req) {
+				series = append(series, logproto.SeriesIdentifier{
+					Labels: stream.labels.Map(),
+				})
 			}
 			return nil
 		})
-
 		if err != nil {
 			return nil, err
 		}
-	}
-	series := make([]logproto.SeriesIdentifier, 0, len(dedupedSeries))
-	for _, v := range dedupedSeries {
-		series = append(series, v)
+	} else {
+		dedupedSeries := make(map[uint64]logproto.SeriesIdentifier)
+		for _, matchers := range groups {
+			err = i.forMatchingStreams(matchers, func(stream *stream) error {
+				// consider the stream only if it overlaps the request time range
+				if shouldConsiderStream(stream, req) {
+					// exit early when this stream was added by an earlier group
+					key := stream.labels.Hash()
+					if _, found := dedupedSeries[key]; found {
+						return nil
+					}
 
+					dedupedSeries[key] = logproto.SeriesIdentifier{
+						Labels: stream.labels.Map(),
+					}
+				}
+				return nil
+			})
+			if err != nil {
+				return nil, err
+			}
+		}
+		series = make([]logproto.SeriesIdentifier, 0, len(dedupedSeries))
+		for _, v := range dedupedSeries {
+			series = append(series, v)
+
+		}
 	}
+
 	return &logproto.SeriesResponse{Series: series}, nil
+}
+
+// forAllStreams will execute a function for all streams in the instance.
+// It uses a function in order to enable generic stream access without accidentally leaking streams under the mutex.
+func (i *instance) forAllStreams(fn func(*stream) error) error {
+	i.streamsMtx.RLock()
+	defer i.streamsMtx.RUnlock()
+
+	for _, stream := range i.streams {
+		err := fn(stream)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // forMatchingStreams will execute a function for each stream that satisfies a set of requirements (time range, matchers, etc).
@@ -427,4 +501,34 @@ func sendBatches(ctx context.Context, i iter.EntryIterator, queryServer logproto
 		ingStats.TotalBatches++
 	}
 	return nil
+}
+
+func sendSampleBatches(ctx context.Context, it iter.SampleIterator, queryServer logproto.Querier_QuerySampleServer) error {
+	ingStats := stats.GetIngesterData(ctx)
+	for !isDone(ctx) {
+		batch, size, err := iter.ReadSampleBatch(it, queryBatchSampleSize)
+		if err != nil {
+			return err
+		}
+		if len(batch.Series) == 0 {
+			return nil
+		}
+
+		if err := queryServer.Send(batch); err != nil {
+			return err
+		}
+		ingStats.TotalLinesSent += int64(size)
+		ingStats.TotalBatches++
+	}
+	return nil
+}
+
+func shouldConsiderStream(stream *stream, req *logproto.SeriesRequest) bool {
+	firstchunkFrom, _ := stream.chunks[0].chunk.Bounds()
+	_, lastChunkTo := stream.chunks[len(stream.chunks)-1].chunk.Bounds()
+
+	if req.End.UnixNano() > firstchunkFrom.UnixNano() && req.Start.UnixNano() <= lastChunkTo.UnixNano() {
+		return true
+	}
+	return false
 }

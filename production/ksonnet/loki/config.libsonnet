@@ -2,7 +2,7 @@
   _config+: {
     namespace: error 'must define namespace',
     cluster: error 'must define cluster',
-    http_listen_port: 80,
+    http_listen_port: 3100,
 
     replication_factor: 3,
     memcached_replicas: 3,
@@ -11,7 +11,10 @@
 
 
     querier: {
-      concurrency: 32,
+      // This value should be set equal to (or less than) the CPU cores of the system the querier runs.
+      // A higher value will lead to a querier trying to process more requests than there are available
+      // cores and will result in scheduling delays.
+      concurrency: 4,
     },
 
     queryFrontend: {
@@ -28,8 +31,7 @@
       query_split_factor:: 3,
     },
 
-    // Default to GCS and Bigtable for chunk and index store
-    storage_backend: 'bigtable,gcs',
+    storage_backend: error 'must define storage_backend as a comma separated list of backends in use,\n    valid entries: dynamodb,s3,gcs,bigtable,cassandra. Typically this would be two entries, e.g. `gcs,bigtable`',
 
     enabledBackends: [
       backend
@@ -38,6 +40,8 @@
 
     table_prefix: $._config.namespace,
     index_period_hours: 168,  // 1 week
+
+    ruler_enabled: false,
 
     // Bigtable variables
     bigtable_instance: error 'must specify bigtable instance',
@@ -162,7 +166,7 @@
         parallelise_shardable_queries: true,
       } else {},
       querier: {
-        query_ingesters_within: '2h', // twice the max-chunk age (1h default) for safety buffer
+        query_ingesters_within: '2h',  // twice the max-chunk age (1h default) for safety buffer
       },
       limits_config: {
         enforce_metric_name: false,
@@ -306,6 +310,29 @@
           },
         },
       },
+
+      ruler: if $._config.ruler_enabled then {
+        rule_path: '/tmp/rules',
+        enable_api: true,
+        alertmanager_url: 'http://alertmanager.%s.svc.cluster.local/alertmanager' % $._config.namespace,
+        enable_sharding: true,
+        enable_alertmanager_v2: true,
+        ring: {
+          kvstore: {
+            store: 'consul',
+            consul: {
+              host: 'consul.%s.svc.cluster.local:8500' % $._config.namespace,
+            },
+          },
+        },
+        storage+: {
+          type: 'gcs',
+          gcs+: {
+            bucket_name: '%(cluster)s-%(namespace)s-ruler' % $._config,
+          },
+        },
+      } else {},
+
     },
   },
 

@@ -4,6 +4,7 @@
 .cache
 *.output
 *.tgz
+*.exe
 requirements.lock
 mixin/vendor/
 cmd/loki/loki
@@ -23,3 +24,8 @@ dlv
 rootfs/
 dist
 coverage.txt
+.DS_Store
+.aws-sam
+
+# emacs
+.#*

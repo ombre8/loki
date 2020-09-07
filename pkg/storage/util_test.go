@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	pkg_util "github.com/cortexproject/cortex/pkg/util"
+
 	"github.com/cortexproject/cortex/pkg/chunk"
 	"github.com/cortexproject/cortex/pkg/chunk/cache"
 	"github.com/cortexproject/cortex/pkg/ingester/client"
@@ -21,7 +23,7 @@ import (
 	"github.com/grafana/loki/pkg/util"
 )
 
-var fooLabelsWithName = "{foo=\"bar\", __name__=\"log\"}"
+var fooLabelsWithName = "{foo=\"bar\", __name__=\"logs\"}"
 var fooLabels = "{foo=\"bar\"}"
 
 var from = time.Unix(0, time.Millisecond.Nanoseconds())
@@ -36,13 +38,35 @@ func assertStream(t *testing.T, expected, actual []logproto.Stream) {
 	for i := range expected {
 		assert.Equal(t, expected[i].Labels, actual[i].Labels)
 		if len(expected[i].Entries) != len(actual[i].Entries) {
-			t.Fatalf("error entries length are different expected %d actual%d\n%s", len(expected[i].Entries), len(actual[i].Entries), spew.Sdump(expected[i].Entries, actual[i].Entries))
+			t.Fatalf("error entries length are different expected %d actual %d\n%s", len(expected[i].Entries), len(actual[i].Entries), spew.Sdump(expected[i].Entries, actual[i].Entries))
 
 			return
 		}
 		for j := range expected[i].Entries {
 			assert.Equal(t, expected[i].Entries[j].Timestamp.UnixNano(), actual[i].Entries[j].Timestamp.UnixNano())
 			assert.Equal(t, expected[i].Entries[j].Line, actual[i].Entries[j].Line)
+		}
+	}
+}
+
+func assertSeries(t *testing.T, expected, actual []logproto.Series) {
+	if len(expected) != len(actual) {
+		t.Fatalf("error stream length are different expected %d actual %d\n%s", len(expected), len(actual), spew.Sdump(expected, actual))
+		return
+	}
+	sort.Slice(expected, func(i int, j int) bool { return expected[i].Labels < expected[j].Labels })
+	sort.Slice(actual, func(i int, j int) bool { return actual[i].Labels < actual[j].Labels })
+	for i := range expected {
+		assert.Equal(t, expected[i].Labels, actual[i].Labels)
+		if len(expected[i].Samples) != len(actual[i].Samples) {
+			t.Fatalf("error entries length are different expected %d actual%d\n%s", len(expected[i].Samples), len(actual[i].Samples), spew.Sdump(expected[i].Samples, actual[i].Samples))
+
+			return
+		}
+		for j := range expected[i].Samples {
+			assert.Equal(t, expected[i].Samples[j].Timestamp, actual[i].Samples[j].Timestamp)
+			assert.Equal(t, expected[i].Samples[j].Value, actual[i].Samples[j].Value)
+			assert.Equal(t, expected[i].Samples[j].Hash, actual[i].Samples[j].Hash)
 		}
 	}
 }
@@ -102,16 +126,25 @@ func newMatchers(matchers string) []*labels.Matcher {
 	return res
 }
 
-func newQuery(query string, start, end time.Time, direction logproto.Direction, shards []astmapper.ShardAnnotation) *logproto.QueryRequest {
+func newQuery(query string, start, end time.Time, shards []astmapper.ShardAnnotation) *logproto.QueryRequest {
 	req := &logproto.QueryRequest{
 		Selector:  query,
 		Start:     start,
 		Limit:     1000,
 		End:       end,
-		Direction: direction,
+		Direction: logproto.FORWARD,
 	}
 	for _, shard := range shards {
 		req.Shards = append(req.Shards, shard.String())
+	}
+	return req
+}
+
+func newSampleQuery(query string, start, end time.Time) *logproto.SampleQueryRequest {
+	req := &logproto.SampleQueryRequest{
+		Selector: query,
+		Start:    start,
+		End:      end,
 	}
 	return req
 }
@@ -168,7 +201,7 @@ func (m *mockChunkStore) GetChunkRefs(ctx context.Context, userID string, from, 
 		refs = append(refs, r)
 	}
 
-	cache, err := cache.New(cache.Config{Prefix: "chunks"})
+	cache, err := cache.New(cache.Config{Prefix: "chunks"}, nil, pkg_util.Logger)
 	if err != nil {
 		panic(err)
 	}
@@ -205,7 +238,7 @@ func (m mockChunkStoreClient) GetChunks(ctx context.Context, chunks []chunk.Chun
 	return res, nil
 }
 
-func (m mockChunkStoreClient) DeleteChunk(ctx context.Context, chunkID string) error {
+func (m mockChunkStoreClient) DeleteChunk(ctx context.Context, userID, chunkID string) error {
 	return nil
 }
 

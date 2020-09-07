@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"strings"
 	"testing"
 	"time"
 
@@ -35,6 +36,18 @@ var (
 	testBlockSize  = 256 * 1024
 	testTargetSize = 1500 * 1024
 )
+
+func TestBlocksInclusive(t *testing.T) {
+	chk := NewMemChunk(EncNone, testBlockSize, testTargetSize)
+	err := chk.Append(logprotoEntry(1, "1"))
+	require.Nil(t, err)
+	err = chk.cut()
+	require.Nil(t, err)
+
+	blocks := chk.Blocks(time.Unix(0, 1), time.Unix(0, 1))
+	require.Equal(t, 1, len(blocks))
+	require.Equal(t, 1, blocks[0].Entries())
+}
 
 func TestBlock(t *testing.T) {
 	for _, enc := range testEncoding {
@@ -111,6 +124,21 @@ func TestBlock(t *testing.T) {
 			}
 
 			require.NoError(t, it.Error())
+			require.NoError(t, it.Close())
+			require.Equal(t, len(cases), idx)
+
+			sampleIt := chk.SampleIterator(context.Background(), time.Unix(0, 0), time.Unix(0, math.MaxInt64), nil, logql.ExtractCount)
+			idx = 0
+			for sampleIt.Next() {
+				s := sampleIt.Sample()
+				require.Equal(t, cases[idx].ts, s.Timestamp)
+				require.Equal(t, 1., s.Value)
+				require.NotEmpty(t, s.Hash)
+				idx++
+			}
+
+			require.NoError(t, sampleIt.Error())
+			require.NoError(t, sampleIt.Close())
 			require.Equal(t, len(cases), idx)
 
 			t.Run("bounded-iteration", func(t *testing.T) {
@@ -224,7 +252,7 @@ func TestSerialization(t *testing.T) {
 		t.Run(enc.String(), func(t *testing.T) {
 			chk := NewMemChunk(enc, testBlockSize, testTargetSize)
 
-			numSamples := 500000
+			numSamples := 50000
 
 			for i := 0; i < numSamples; i++ {
 				require.NoError(t, chk.Append(logprotoEntry(int64(i), string(i))))
@@ -245,8 +273,17 @@ func TestSerialization(t *testing.T) {
 				require.Equal(t, int64(i), e.Timestamp.UnixNano())
 				require.Equal(t, string(i), e.Line)
 			}
-
 			require.NoError(t, it.Error())
+
+			sampleIt := bc.SampleIterator(context.Background(), time.Unix(0, 0), time.Unix(0, math.MaxInt64), nil, logql.ExtractCount)
+			for i := 0; i < numSamples; i++ {
+				require.True(t, sampleIt.Next(), i)
+
+				s := sampleIt.Sample()
+				require.Equal(t, int64(i), s.Timestamp)
+				require.Equal(t, 1., s.Value)
+			}
+			require.NoError(t, sampleIt.Error())
 
 			byt2, err := chk.Bytes()
 			require.NoError(t, err)
@@ -712,4 +749,21 @@ func TestMemChunk_IteratorBounds(t *testing.T) {
 
 	}
 
+}
+
+func TestMemchunkLongLine(t *testing.T) {
+	for _, enc := range testEncoding {
+		t.Run(enc.String(), func(t *testing.T) {
+			c := NewMemChunk(enc, testBlockSize, testTargetSize)
+			for i := 1; i <= 10; i++ {
+				require.NoError(t, c.Append(&logproto.Entry{Timestamp: time.Unix(0, int64(i)), Line: strings.Repeat("e", 200000)}))
+			}
+			it, err := c.Iterator(context.Background(), time.Unix(0, 0), time.Unix(0, 100), logproto.FORWARD, nil)
+			require.NoError(t, err)
+			for i := 1; i <= 10; i++ {
+				require.True(t, it.Next())
+			}
+			require.False(t, it.Next())
+		})
+	}
 }

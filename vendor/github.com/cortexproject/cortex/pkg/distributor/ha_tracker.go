@@ -94,7 +94,7 @@ type HATrackerConfig struct {
 	// more than this duration
 	FailoverTimeout time.Duration `yaml:"ha_tracker_failover_timeout"`
 
-	KVStore kv.Config
+	KVStore kv.Config `yaml:"kvstore" doc:"description=Backend storage to use for the ring. Please be aware that memberlist is not supported by the HA tracker since gossip propagation is too slow for HA purposes."`
 }
 
 // RegisterFlags adds the flags required to config this to the given FlagSet.
@@ -236,7 +236,7 @@ func (c *haTracker) checkReplica(ctx context.Context, userID, cluster, replica s
 		// The callback within checkKVStore will return a 202 if the sample is being deduped,
 		// otherwise there may have been an actual error CAS'ing that we should log.
 		if resp, ok := httpgrpc.HTTPResponseFromError(err); ok && resp.GetCode() != 202 {
-			level.Error(util.Logger).Log("msg", "rejecting sample", "error", err)
+			level.Error(util.Logger).Log("msg", "rejecting sample", "err", err)
 		}
 	}
 	return err
